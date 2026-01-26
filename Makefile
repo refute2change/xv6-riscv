@@ -146,8 +146,8 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 
-fs.img: mkfs/mkfs README $(UPROGS)
-	mkfs/mkfs fs.img README $(UPROGS)
+fs.img: mkfs/mkfs README $(UPROGS) domains.txt
+	mkfs/mkfs fs.img README $(UPROGS) domains.txt
 
 -include kernel/*.d user/*.d
 
