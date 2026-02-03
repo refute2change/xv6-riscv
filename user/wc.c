@@ -77,8 +77,13 @@ main(int argc, char *argv[])
       char *p = argv[i] + 1;
       while(*p){
         if(*p == 'l') flag_l = 1;
-        if(*p == 'w') flag_w = 1;
-        if(*p == 'c') flag_c = 1;
+        else if(*p == 'w') flag_w = 1;
+        else if(*p == 'c') flag_c = 1;
+        else
+        {
+          printf("wc: unknown flag %c\n", *p);
+          exit(0);
+        }
         p++;
       }
     }
