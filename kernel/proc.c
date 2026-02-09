@@ -106,7 +106,7 @@ allocpid()
 // Look in the process table for an UNUSED proc.
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
-// If there are no free procs, or a memory allocation fails, return 0.
+// If there are no   procs, or a memory allocation fails, return 0.
 static struct proc*
 allocproc(void)
 {
@@ -125,7 +125,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
-
+  p->trace_mask = 0;
+  
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
