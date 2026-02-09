@@ -104,6 +104,7 @@ main(int argc, char *argv[])
   if (argc > 1 && argv[1][0] == '-'){
     char *p = argv[1] + 1;
     limit_argc++;
+    
     while (*p){
       if (*p == 'n'){
         flag_n = 1;
