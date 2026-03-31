@@ -147,6 +147,7 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 	$U/_ps\
+	$U/_mmaptest\
 
 fs.img: mkfs/mkfs README $(UPROGS) domains.txt
 	mkfs/mkfs fs.img README $(UPROGS) domains.txt

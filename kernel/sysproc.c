@@ -114,11 +114,24 @@ sys_getprocs(void)
   uint64 addr;
   argaddr(0, &addr);
   return getprocs(addr);
-}uint64
+}
+uint64
 sys_trace(void)
 {
   int mask;
   argint(0, &mask);
   myproc()->trace_mask = mask;
   return 0;
+}
+uint64
+sys_mmap(void)
+{
+  return mmap();
+}
+uint64
+sys_munmap(void)
+{
+  uint64 va;
+  argaddr(0, &va);
+  return munmap(va);
 }
