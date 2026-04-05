@@ -23,10 +23,17 @@ struct {
   struct run *freelist;
 } kmem;
 
+// advanced task - struct to track reference counts
+struct {
+  struct spinlock lock;
+  int count[PHYSTOP / PGSIZE];
+} ref; 
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&ref.lock, "ref"); // advanced task - initialize the lock for reference counter
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,6 +57,15 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  // advanced task - free the memory if the reference count drops to 0
+  acquire(&ref.lock);
+  int c = --ref.count[(uint64)pa / PGSIZE];
+  release(&ref.lock);
+
+  // advanced task - if other processes are still using this page, return immediately
+  if(c > 0)
+    return;
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +92,21 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
+    // advanced task - initialize reference count by 1
+    acquire(&ref.lock);
+    ref.count[(uint64)r / PGSIZE] = 1;
+    release(&ref.lock);
+  }
   return (void*)r;
+}
+
+// advanced task - add a reference to a physical page
+void
+kaddref(void *pa)
+{
+  acquire(&ref.lock);
+  ref.count[(uint64)pa / PGSIZE]++;
+  release(&ref.lock);
 }

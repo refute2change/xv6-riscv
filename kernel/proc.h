@@ -1,4 +1,11 @@
 #include "kernel/getproc.h"
+// advanced task - define mmap flags and protections (Standard Linux values)
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define MAP_SHARED  0x1
+#define MAP_PRIVATE 0x2
+
+#define NVMA 16 // advanced task - maximum VMAs per process
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -80,6 +87,17 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+// advanced task - data structure: Virtual Memory Area (VMA)
+struct vma {
+  int valid;       // 1 if this VMA slot is in use, 0 if free
+  uint64 addr;     // Starting virtual address of the mapped region
+  int length;      // Length of the region in bytes
+  int prot;        // Permissions (PROT_READ, PROT_WRITE)
+  int flags;       // MAP_SHARED or MAP_PRIVATE
+  struct file *f;  // Pointer to the file (if file-backed, 0 if anonymous)
+  int offset;      // Offset in the file
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -103,4 +121,5 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct vma vmas[NVMA];       // advanced task - Virtual Memory Areas for mmap
 };

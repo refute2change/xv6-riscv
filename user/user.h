@@ -1,4 +1,8 @@
 #define SBRK_ERROR ((char *)-1)
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define MAP_SHARED  0x1
+#define MAP_PRIVATE 0x2
 
 struct stat;
 struct procinfo;
@@ -52,5 +56,10 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 void* malloc(uint);
 void free(void*);
 
+/* initial mmap() and munmap()
 uint64 mmap(void);
 int munmap(uint64);
+*/
+
+uint64 mmap(uint64 addr, int length, int prot, int flags, int fd, int offset);
+int munmap(uint64 addr, int length);

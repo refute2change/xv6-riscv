@@ -123,6 +123,7 @@ sys_trace(void)
   myproc()->trace_mask = mask;
   return 0;
 }
+/* initial implementation of mmap and munmap
 uint64
 sys_mmap(void)
 {
@@ -135,3 +136,4 @@ sys_munmap(void)
   argaddr(0, &va);
   return munmap(va);
 }
+*/

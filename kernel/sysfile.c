@@ -3,7 +3,7 @@
 // Mostly argument checking, since we don't trust
 // user code, and calls into file.c and fs.c.
 //
-
+#include "memlayout.h" // advanced task - add memlayout.h for TRAPFRAME
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -501,5 +502,107 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+// advanced task - sys_mmap and sys_munmap, as sysfile.c has access to necessary argfd and filedup file structure
+uint64
+sys_mmap(void)
+{
+  uint64 addr, length;
+  int prot, flags, fd, offset;
+  struct file *f = 0;
+  struct proc *p = myproc();
+
+  // 1. Fetch the 6 arguments standard to Linux mmap
+  argaddr(0, &addr);
+  argaddr(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(4, &fd);
+  argint(5, &offset);
+
+  // 2. If a file descriptor is provided...
+  if(fd >= 0){
+    if(argfd(4, &fd, &f) < 0)
+      return -1;
+  }
+
+  // 3. Find a free VMA slot in the process
+  struct vma *v = 0;
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].valid == 0){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0) return -1; // Error: No free VMAs
+
+  // 4. Calculate a dynamic virtual address
+  // In xv6, we map memory safely by starting just below the Trapframe
+  // and growing downwards for each new VMA.
+  uint64 new_addr = TRAPFRAME;
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].valid && p->vmas[i].addr < new_addr){
+      new_addr = p->vmas[i].addr; // Find the lowest currently mapped VMA
+    }
+  }
+  new_addr -= PGROUNDUP(length); // Move down by the requested size
+
+  // 5. Populate the VMA structure
+  v->valid = 1;
+  v->addr = new_addr;
+  v->length = length;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = f;
+  v->offset = offset;
+
+  // 6. If we are mapping a file, increment its reference count
+  // so the file isn't closed on the disk while we have it in memory
+  if(f) {
+    filedup(f);
+  }
+
+  // Notice we DO NOT allocate physical memory here! (Lazy Allocation)
+  return new_addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+  struct proc *p = myproc();
+
+  // 1. Fetch arguments
+  argaddr(0, &addr);
+  argint(1, &length);
+
+  // 2. Find the VMA containing this address
+  struct vma *v = 0;
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].valid && addr >= p->vmas[i].addr && addr < p->vmas[i].addr + p->vmas[i].length){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+
+  // If no matching VMA is found, return error
+  if(v == 0) return -1;
+
+  // 3. Unmap the memory.
+  // uvmunmap takes (pagetable, start_addr, number_of_pages, do_free)
+  // Because we modified kfree in Step 1, do_free=1 is perfectly safe here!
+  uvmunmap(p->pagetable, addr, length / PGSIZE, 1);
+
+  // 4. Close the file if it was file-backed, to release the OS lock on the inode
+  if(v->f){
+    fileclose(v->f);
+  }
+
+  // 5. Clear the VMA slot
+  v->valid = 0;
+
   return 0;
 }

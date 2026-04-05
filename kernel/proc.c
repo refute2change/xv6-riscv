@@ -142,6 +142,11 @@ found:
     return 0;
   }
 
+  // advanced task: initialize all VMA slots as free
+  for(int i = 0; i < NVMA; i++) {
+    p->vmas[i].valid = 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -291,6 +296,37 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+  
+  // advanced task - copy VMA to the child process
+  for(i = 0; i < NVMA; i++) {
+    if(p->vmas[i].valid) {
+      np->vmas[i] = p->vmas[i]; // Copy the VMA structure
+      
+      // Increment the file reference count if it's file-backed
+      if(np->vmas[i].f) {
+        filedup(np->vmas[i].f);
+      }
+
+      // We must copy the actual page table entries.
+      // Because allocation is lazy, we only map pages that the parent has actually faulted in.
+      struct vma *v = &p->vmas[i];
+      for(uint64 a = v->addr; a < v->addr + v->length; a += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, a, 0);
+        if(pte && (*pte & PTE_V)) { // If the page is valid and mapped in the parent
+          uint64 pa = PTE2PA(*pte);
+          int flags = PTE_FLAGS(*pte);
+          
+          // Map the same physical page into the child's page table
+          if(mappages(np->pagetable, a, PGSIZE, pa, flags) != 0) {
+            panic("fork: mappages failed for VMA");
+          }
+          
+          // CRITICAL: Increment the physical memory reference count!
+          kaddref((void*)pa);
+        }
+      }
+    }
+  }
 
   pid = np->pid;
 
@@ -332,6 +368,21 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // advanced task - clean up VMA
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].valid) {
+      // Unmap the memory. 
+      // Because we modified kfree(), it will safely decrement the ref count.
+      uvmunmap(p->pagetable, p->vmas[i].addr, p->vmas[i].length / PGSIZE, 1);
+      
+      // Release the file lock
+      if(p->vmas[i].f) {
+        fileclose(p->vmas[i].f);
+      }
+      p->vmas[i].valid = 0;
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
