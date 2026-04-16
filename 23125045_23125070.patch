@@ -1,0 +1,781 @@
+diff --git a/Makefile b/Makefile
+index eb3a69e..a527637 100644
+--- a/Makefile
++++ b/Makefile
+@@ -147,6 +147,7 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_ps\
++	$U/_mmaptest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS) domains.txt
+ 	mkfs/mkfs fs.img README $(UPROGS) domains.txt
+diff --git a/kernel/defs.h b/kernel/defs.h
+index b686981..aa9e6e3 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -59,6 +59,7 @@ void            ireclaim(int);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            kaddref(void *);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -182,5 +183,11 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++void            init_shmem(void);
++uint64          sys_mmap(void);
++uint64          sys_munmap(void);
++uint64          mmap(void);
++int             munmap(uint64 va);
++
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..3161c1a 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -23,10 +23,17 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
++// advanced task - struct to track reference counts
++struct {
++  struct spinlock lock;
++  int count[PHYSTOP / PGSIZE];
++} ref; 
++
+ void
+ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
++  initlock(&ref.lock, "ref"); // advanced task - initialize the lock for reference counter
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -51,6 +58,15 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  // advanced task - free the memory if the reference count drops to 0
++  acquire(&ref.lock);
++  int c = --ref.count[(uint64)pa / PGSIZE];
++  release(&ref.lock);
++
++  // advanced task - if other processes are still using this page, return immediately
++  if(c > 0)
++    return;
++
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -76,7 +92,21 @@ kalloc(void)
+     kmem.freelist = r->next;
+   release(&kmem.lock);
+ 
+-  if(r)
++  if(r){
+     memset((char*)r, 5, PGSIZE); // fill with junk
++    // advanced task - initialize reference count by 1
++    acquire(&ref.lock);
++    ref.count[(uint64)r / PGSIZE] = 1;
++    release(&ref.lock);
++  }
+   return (void*)r;
+ }
++
++// advanced task - add a reference to a physical page
++void
++kaddref(void *pa)
++{
++  acquire(&ref.lock);
++  ref.count[(uint64)pa / PGSIZE]++;
++  release(&ref.lock);
++}
+\ No newline at end of file
+diff --git a/kernel/main.c b/kernel/main.c
+index f0d3171..48d46d8 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -16,6 +16,7 @@ main()
+     printf("\n");
+     printf("xv6 kernel is booting\n");
+     printf("\n");
++    init_shmem();    // initialize shared memory page
+     kinit();         // physical page allocator
+     kvminit();       // create kernel page table
+     kvminithart();   // turn on paging
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 001760a..807cfdc 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -142,6 +142,11 @@ found:
+     return 0;
+   }
+ 
++  // advanced task: initialize all VMA slots as free
++  for(int i = 0; i < NVMA; i++) {
++    p->vmas[i].valid = 0;
++  }
++
+   // Set up new context to start executing at forkret,
+   // which returns to user space.
+   memset(&p->context, 0, sizeof(p->context));
+@@ -291,6 +296,37 @@ kfork(void)
+   np->cwd = idup(p->cwd);
+ 
+   safestrcpy(np->name, p->name, sizeof(p->name));
++  
++  // advanced task - copy VMA to the child process
++  for(i = 0; i < NVMA; i++) {
++    if(p->vmas[i].valid) {
++      np->vmas[i] = p->vmas[i]; // Copy the VMA structure
++      
++      // Increment the file reference count if it's file-backed
++      if(np->vmas[i].f) {
++        filedup(np->vmas[i].f);
++      }
++
++      // We must copy the actual page table entries.
++      // Because allocation is lazy, we only map pages that the parent has actually faulted in.
++      struct vma *v = &p->vmas[i];
++      for(uint64 a = v->addr; a < v->addr + v->length; a += PGSIZE) {
++        pte_t *pte = walk(p->pagetable, a, 0);
++        if(pte && (*pte & PTE_V)) { // If the page is valid and mapped in the parent
++          uint64 pa = PTE2PA(*pte);
++          int flags = PTE_FLAGS(*pte);
++          
++          // Map the same physical page into the child's page table
++          if(mappages(np->pagetable, a, PGSIZE, pa, flags) != 0) {
++            panic("fork: mappages failed for VMA");
++          }
++          
++          // CRITICAL: Increment the physical memory reference count!
++          kaddref((void*)pa);
++        }
++      }
++    }
++  }
+ 
+   pid = np->pid;
+ 
+@@ -333,6 +369,21 @@ kexit(int status)
+   if(p == initproc)
+     panic("init exiting");
+ 
++  // advanced task - clean up VMA
++  for(int i = 0; i < NVMA; i++) {
++    if(p->vmas[i].valid) {
++      // Unmap the memory. 
++      // Because we modified kfree(), it will safely decrement the ref count.
++      uvmunmap(p->pagetable, p->vmas[i].addr, p->vmas[i].length / PGSIZE, 1);
++      
++      // Release the file lock
++      if(p->vmas[i].f) {
++        fileclose(p->vmas[i].f);
++      }
++      p->vmas[i].valid = 0;
++    }
++  }
++
+   // Close all open files.
+   for(int fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd]){
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 498a9de..ca804fb 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,4 +1,11 @@
+ #include "kernel/getproc.h"
++// advanced task - define mmap flags and protections (Standard Linux values)
++#define PROT_READ   0x1
++#define PROT_WRITE  0x2
++#define MAP_SHARED  0x1
++#define MAP_PRIVATE 0x2
++
++#define NVMA 16 // advanced task - maximum VMAs per process
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+@@ -80,6 +87,17 @@ struct trapframe {
+   /* 280 */ uint64 t6;
+ };
+ 
++// advanced task - data structure: Virtual Memory Area (VMA)
++struct vma {
++  int valid;       // 1 if this VMA slot is in use, 0 if free
++  uint64 addr;     // Starting virtual address of the mapped region
++  int length;      // Length of the region in bytes
++  int prot;        // Permissions (PROT_READ, PROT_WRITE)
++  int flags;       // MAP_SHARED or MAP_PRIVATE
++  struct file *f;  // Pointer to the file (if file-backed, 0 if anonymous)
++  int offset;      // Offset in the file
++};
++
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -103,4 +121,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct vma vmas[NVMA];       // advanced task - Virtual Memory Areas for mmap
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 04854e5..7fed870 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,8 @@ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_getprocs(void);
+ extern uint64 sys_trace(void);
++extern uint64 sys_mmap(void);
++extern uint64 sys_munmap(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +132,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_close]   sys_close,
+ [SYS_getprocs]   sys_getprocs,
+ [SYS_trace]   sys_trace,
++[SYS_mmap]    sys_mmap,
++[SYS_munmap]  sys_munmap,
+ };
+ 
+ static char *syscall_names[] = {
+@@ -156,6 +160,8 @@ static char *syscall_names[] = {
+ [SYS_close]   "close",
+ [SYS_getprocs]   "ps",
+ [SYS_trace]   "trace",
++[SYS_mmap]    "mmap",
++[SYS_munmap]  "munmap",
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 4c301cb..ea2b213 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,3 +22,5 @@
+ #define SYS_close  21
+ #define SYS_getprocs  22
+ #define SYS_trace  23
++#define SYS_mmap 24
++#define SYS_munmap 25
+\ No newline at end of file
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index d8234ce..7f6fda0 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -3,7 +3,7 @@
+ // Mostly argument checking, since we don't trust
+ // user code, and calls into file.c and fs.c.
+ //
+-
++#include "memlayout.h" // advanced task - add memlayout.h for TRAPFRAME
+ #include "types.h"
+ #include "riscv.h"
+ #include "defs.h"
+@@ -16,6 +16,7 @@
+ #include "file.h"
+ #include "fcntl.h"
+ 
++
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -503,3 +504,105 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++// advanced task - sys_mmap and sys_munmap, as sysfile.c has access to necessary argfd and filedup file structure
++uint64
++sys_mmap(void)
++{
++  uint64 addr, length;
++  int prot, flags, fd, offset;
++  struct file *f = 0;
++  struct proc *p = myproc();
++
++  // 1. Fetch the 6 arguments standard to Linux mmap
++  argaddr(0, &addr);
++  argaddr(1, &length);
++  argint(2, &prot);
++  argint(3, &flags);
++  argint(4, &fd);
++  argint(5, &offset);
++
++  // 2. If a file descriptor is provided...
++  if(fd >= 0){
++    if(argfd(4, &fd, &f) < 0)
++      return -1;
++  }
++
++  // 3. Find a free VMA slot in the process
++  struct vma *v = 0;
++  for(int i = 0; i < NVMA; i++){
++    if(p->vmas[i].valid == 0){
++      v = &p->vmas[i];
++      break;
++    }
++  }
++  if(v == 0) return -1; // Error: No free VMAs
++
++  // 4. Calculate a dynamic virtual address
++  // In xv6, we map memory safely by starting just below the Trapframe
++  // and growing downwards for each new VMA.
++  uint64 new_addr = TRAPFRAME;
++  for(int i = 0; i < NVMA; i++){
++    if(p->vmas[i].valid && p->vmas[i].addr < new_addr){
++      new_addr = p->vmas[i].addr; // Find the lowest currently mapped VMA
++    }
++  }
++  new_addr -= PGROUNDUP(length); // Move down by the requested size
++
++  // 5. Populate the VMA structure
++  v->valid = 1;
++  v->addr = new_addr;
++  v->length = length;
++  v->prot = prot;
++  v->flags = flags;
++  v->f = f;
++  v->offset = offset;
++
++  // 6. If we are mapping a file, increment its reference count
++  // so the file isn't closed on the disk while we have it in memory
++  if(f) {
++    filedup(f);
++  }
++
++  // Notice we DO NOT allocate physical memory here! (Lazy Allocation)
++  return new_addr;
++}
++
++uint64
++sys_munmap(void)
++{
++  uint64 addr;
++  int length;
++  struct proc *p = myproc();
++
++  // 1. Fetch arguments
++  argaddr(0, &addr);
++  argint(1, &length);
++
++  // 2. Find the VMA containing this address
++  struct vma *v = 0;
++  for(int i = 0; i < NVMA; i++){
++    if(p->vmas[i].valid && addr >= p->vmas[i].addr && addr < p->vmas[i].addr + p->vmas[i].length){
++      v = &p->vmas[i];
++      break;
++    }
++  }
++
++  // If no matching VMA is found, return error
++  if(v == 0) return -1;
++
++  // 3. Unmap the memory.
++  // uvmunmap takes (pagetable, start_addr, number_of_pages, do_free)
++  // Because we modified kfree in Step 1, do_free=1 is perfectly safe here!
++  uvmunmap(p->pagetable, addr, length / PGSIZE, 1);
++
++  // 4. Close the file if it was file-backed, to release the OS lock on the inode
++  if(v->f){
++    fileclose(v->f);
++  }
++
++  // 5. Clear the VMA slot
++  v->valid = 0;
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index ca8c09b..c920213 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -114,11 +114,26 @@ sys_getprocs(void)
+   uint64 addr;
+   argaddr(0, &addr);
+   return getprocs(addr);
+-}uint64
++}
++uint64
+ sys_trace(void)
+ {
+   int mask;
+   argint(0, &mask);
+   myproc()->trace_mask = mask;
+   return 0;
+-}
+\ No newline at end of file
++}
++/* initial implementation of mmap and munmap
++uint64
++sys_mmap(void)
++{
++  return mmap();
++}
++uint64
++sys_munmap(void)
++{
++  uint64 va;
++  argaddr(0, &va);
++  return munmap(va);
++}
++*/
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a41cd69..a29238c 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -68,9 +68,48 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else if((r_scause() == 15 || r_scause() == 13) &&
+-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
+-    // page fault on lazily-allocated page
++  } else if(r_scause() == 13 || r_scause() == 15) { 
++    // advanced task - the page fault handler
++    uint64 fault_va = r_stval(); // Get the address the user tried to touch
++    struct proc *p = myproc();
++    struct vma *v = 0;
++
++    // 1. Check if the address belongs to a valid VMA (mmap region)
++    for(int i = 0; i < NVMA; i++){
++      if(p->vmas[i].valid && fault_va >= p->vmas[i].addr && fault_va < p->vmas[i].addr + p->vmas[i].length){
++        v = &p->vmas[i];
++        break;
++      }
++    }
++
++    if(v != 0){
++      // --- Handle mmap Lazy Allocation ---
++      void *pa = kalloc();
++      if(pa == 0){
++        p->killed = 1; // Out of memory
++      } else {
++        memset(pa, 0, PGSIZE);
++
++        // Set the correct permissions based on the VMA
++        int pte_flags = PTE_U;
++        if(v->prot & PROT_READ) pte_flags |= PTE_R;
++        if(v->prot & PROT_WRITE) pte_flags |= PTE_W;
++
++        // Map the new physical page to the faulting virtual address
++        if(mappages(p->pagetable, PGROUNDDOWN(fault_va), PGSIZE, (uint64)pa, pte_flags) != 0){
++          kfree(pa);
++          p->killed = 1; // Mapping failed
++        }
++      }
++    } else {
++      // --- Handle Heap Lazy Allocation ---
++      // The address wasn't in a VMA. Try lazy sbrk via vmfault.
++      if(vmfault(p->pagetable, fault_va, (r_scause() == 13)? 1 : 0) != 0) {
++        // Both mmap and heap failed. It's a genuine segmentation fault!
++        printf("Segmentation Fault: Process %d killed.\n", p->pid);
++        p->killed = 1;
++      }
++    }
+   } else {
+     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 28f4248..a39054a 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -8,6 +8,16 @@
+ #include "proc.h"
+ #include "fs.h"
+ 
++// Structure to track our single shared memory page
++struct {
++  uint64 pa;              // Physical address of the shared page
++  int refcount;           // Reference count
++  struct spinlock lock;   // Lock to protect access
++  int allocated;          // Whether the page is allocated
++} shmem_page;
++
++// Define a specific region for shared memory
++#define SHMEM_REGION 0x4000000  // 64MB mark
+ /*
+  * the kernel's page table.
+  */
+@@ -203,6 +213,24 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+       continue;   
+     if((*pte & PTE_V) == 0)  // has physical page been allocated?
+       continue;
++    if (a == SHMEM_REGION) {
++      acquire(&shmem_page.lock);
++      shmem_page.refcount--;
++      
++      // Only free the physical page when the reference count reaches zero
++      if (shmem_page.refcount == 0 && shmem_page.allocated) {
++        if (do_free) {
++          uint64 pa = PTE2PA(*pte);
++          kfree((void*)pa);
++        }
++        shmem_page.allocated = 0;
++        shmem_page.pa = 0;
++      }
++      release(&shmem_page.lock);
++      
++      *pte = 0;
++      continue; // Skip normal freeing operation for shared page
++    }
+     if(do_free){
+       uint64 pa = PTE2PA(*pte);
+       kfree((void*)pa);
+@@ -316,6 +344,24 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+       goto err;
+     }
+   }
++
++  // Detect if the parent has mapped SHMEM_REGION
++  if((pte = walk(old, SHMEM_REGION, 0)) != 0 && (*pte & PTE_V)) {
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    
++    // Map the same physical page to the child
++    if(mappages(new, SHMEM_REGION, PGSIZE, pa, flags) != 0){
++      goto err;
++    }
++    
++    // Increment reference count to track the new mapping
++    acquire(&shmem_page.lock);
++    shmem_page.refcount++;
++    release(&shmem_page.lock);
++  }
++  // --------------------------------
++
+   return 0;
+ 
+  err:
+@@ -484,3 +530,94 @@ ismapped(pagetable_t pagetable, uint64 va)
+   }
+   return 0;
+ }
++
++void
++init_shmem(void)
++{
++  initlock(&shmem_page.lock, "shmem_lock");
++  shmem_page.pa = 0;
++  shmem_page.refcount = 0;
++  shmem_page.allocated = 0;
++}
++
++uint64
++mmap(void)
++{
++  struct proc *p = myproc();
++  
++  // Acquire a lock to protect shared memory operations
++  acquire(&shmem_page.lock);
++  
++  // Check if this is the first allocation request
++  if (shmem_page.allocated == 0) {
++    // Allocate a physical page and clear it
++    void *pa = kalloc();
++    if (pa == 0) {
++      release(&shmem_page.lock);
++      return 0;
++    }
++    memset(pa, 0, PGSIZE);
++    
++    shmem_page.pa = (uint64)pa;
++    shmem_page.allocated = 1;
++    shmem_page.refcount = 1;
++  } else {
++    // Reuse existing page and increment reference count
++    shmem_page.refcount++;
++  }
++  
++  // Map the physical page into the process's address space at SHMEM_REGION
++  // with appropriate permissions (Read, Write, User)
++  if (mappages(p->pagetable, SHMEM_REGION, PGSIZE, shmem_page.pa, PTE_W | PTE_R | PTE_U) != 0) {
++    // Handle error cases by decrementing the reference count and freeing resources
++    shmem_page.refcount--;
++    if (shmem_page.refcount == 0) {
++      kfree((void*)shmem_page.pa);
++      shmem_page.allocated = 0;
++      shmem_page.pa = 0;
++    }
++    release(&shmem_page.lock);
++    return 0;
++  }
++  
++  release(&shmem_page.lock);
++  
++  // Return the virtual address of the mapped shared memory region
++  return SHMEM_REGION;
++}
++
++int
++munmap(uint64 va)
++{
++  // Validate that the address is the shared memory region address
++  if (va != SHMEM_REGION) {
++    return -1;
++  }
++  
++  struct proc *p = myproc();
++  
++  // Use walk() to find the page table entry (PTE)
++  pte_t *pte = walk(p->pagetable, va, 0);
++  
++  // Check if the page is valid and mapped
++  if (pte == 0 || (*pte & PTE_V) == 0) {
++    return -1;
++  }
++  
++  // Clear the PTE to remove the mapping
++  *pte = 0;
++  
++  // Acquire the lock to safely modify the reference count
++  acquire(&shmem_page.lock);
++  shmem_page.refcount--;
++  
++  // If reference count reaches zero, free the physical page
++  if (shmem_page.refcount == 0 && shmem_page.allocated) {
++    kfree((void*)shmem_page.pa);
++    shmem_page.allocated = 0;
++    shmem_page.pa = 0;
++  }
++  release(&shmem_page.lock);
++  
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/mmaptest.c b/user/mmaptest.c
+new file mode 100644
+index 0000000..37b1bb8
+--- /dev/null
++++ b/user/mmaptest.c
+@@ -0,0 +1,83 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++#define PGSIZE 4096
++
++int
++main(int argc, char *argv[])
++{
++  uint64 addr1, addr2, addr3;
++
++  printf("--- Testing Multiple Dynamic Mmaps ---\n");
++
++  // 1. Map 3 distinct regions
++  // Region 1: 1 Page
++  addr1 = mmap(0, PGSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, -1, 0);
++  // Region 2: 1 Page
++  addr2 = mmap(0, PGSIZE, PROT_READ | PROT_WRITE, MAP_SHARED, -1, 0);
++  // Region 3: 2 Pages (8192 bytes)
++  addr3 = mmap(0, PGSIZE * 2, PROT_READ | PROT_WRITE, MAP_SHARED, -1, 0); 
++
++  if(addr1 == (uint64)-1 || addr2 == (uint64)-1 || addr3 == (uint64)-1){
++    printf("mmap failed\n");
++    exit(1);
++  }
++
++  // Verify dynamic addressing
++  printf("Mapped Region 1 at: %p (Size: 1 Page)\n", (void*)addr1);
++  printf("Mapped Region 2 at: %p (Size: 1 Page)\n", (void*)addr2);
++  printf("Mapped Region 3 at: %p (Size: 2 Pages)\n", (void*)addr3);
++
++  // 2. Write to them (This triggers 4 separate Page Faults!)
++  *(int*)addr1 = 111;
++  *(int*)addr2 = 222;
++  
++  // Write to both the first AND second page of Region 3
++  *(int*)addr3 = 333;
++  *((int*)(addr3 + PGSIZE)) = 444; 
++
++  printf("Parent wrote data: %d, %d, %d, %d\n", 
++          *(int*)addr1, *(int*)addr2, *(int*)addr3, *((int*)(addr3 + PGSIZE)));
++
++  // 3. Fork and share
++  int pid = fork();
++  if(pid < 0){
++    printf("Fork failed\n");
++    exit(1);
++  }
++
++  if(pid == 0){
++    // Child process reads the shared data from all 3 regions
++    printf("Child read data:   %d, %d, %d, %d\n", 
++            *(int*)addr1, *(int*)addr2, *(int*)addr3, *((int*)(addr3 + PGSIZE)));
++
++    // Modify data in Region 2 and the second page of Region 3
++    *(int*)addr2 = 999;
++    *((int*)(addr3 + PGSIZE)) = 888;
++    printf("Child modified Region 2 and Region 3 (Page 2)\n");
++
++    // Unmap JUST Region 1 to test independent munmap
++    if(munmap(addr1, PGSIZE) < 0)
++      printf("Child: munmap Region 1 failed\n");
++    else
++      printf("Child: unmapped Region 1 only\n");
++
++    exit(0);
++  } else {
++    // Parent process waits for child
++    wait(0);
++
++    // Verify the child's modifications are visible in the specific regions
++    printf("Parent read later: %d, %d, %d, %d\n", 
++            *(int*)addr1, *(int*)addr2, *(int*)addr3, *((int*)(addr3 + PGSIZE)));
++
++    // 4. Cleanup
++    munmap(addr1, PGSIZE);
++    munmap(addr2, PGSIZE);
++    munmap(addr3, PGSIZE * 2);
++    printf("Parent unmapped all regions\n");
++  }
++
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index d36e012..cc3aa33 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,8 @@
+ #define SBRK_ERROR ((char *)-1)
++#define PROT_READ   0x1
++#define PROT_WRITE  0x2
++#define MAP_SHARED  0x1
++#define MAP_PRIVATE 0x2
+ 
+ struct stat;
+ struct procinfo;
+@@ -51,3 +55,11 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
+ // umalloc.c
+ void* malloc(uint);
+ void free(void*);
++
++/* initial mmap() and munmap()
++uint64 mmap(void);
++int munmap(uint64);
++*/
++
++uint64 mmap(uint64 addr, int length, int prot, int flags, int fd, int offset);
++int munmap(uint64 addr, int length);
+\ No newline at end of file
+diff --git a/user/usys.pl b/user/usys.pl
+index 351b4fc..c7aeb9d 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,3 +44,5 @@ entry("pause");
+ entry("uptime");
+ entry("getprocs");
+ entry("trace");
++entry("mmap");
++entry("munmap");
+\ No newline at end of file

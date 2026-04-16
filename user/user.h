@@ -63,3 +63,34 @@ int munmap(uint64);
 
 uint64 mmap(uint64 addr, int length, int prot, int flags, int fd, int offset);
 int munmap(uint64 addr, int length);
+
+typedef struct {
+    uint64 addr;
+    int length;
+    int prot;
+    int flags;
+    int fd;
+    int offset;
+} mmap_args;
+typedef struct {
+    uint64 addr;
+    int length;
+} munmap_args;
+
+#define mmap(...) var_mmap((mmap_args){__VA_ARGS__})
+#define munmap(...) var_munmap((munmap_args){__VA_ARGS__})
+
+static inline uint64 var_mmap(mmap_args in){
+    uint64 addr_out = in.addr ? in.addr: 0;
+    int length_out = in.length ? in.length: 4096;
+    int prot_out = in.prot ? in.prot: 0x1 | 0x2;
+    int flags_out = in.flags? in.flags: 0x1;
+    int fd_out = in.fd? in.fd: -1;
+    int offset_out = in.offset? in.offset: 0;
+    return (mmap)(addr_out, length_out, prot_out, flags_out, fd_out, offset_out);
+}
+static inline int var_munmap(munmap_args in){
+    uint64 addr_out = in.addr ? in.addr: 0;
+    int length_out = in.length ? in.length: 4096;
+    return (munmap)(addr_out, length_out);
+}
